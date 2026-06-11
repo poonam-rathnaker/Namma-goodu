@@ -17,70 +17,39 @@ exports.handler = async function (event) {
     return { statusCode: 400, body: JSON.stringify({ error: { message: 'propertyUrl is required' } }) };
   }
 
-  // Try to fetch the listing page directly
-  let pageContent = null;
-  try {
-    const pageRes = await fetch(propertyUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-AU,en;q=0.9',
-      }
-    });
-    if (pageRes.ok) {
-      const html = await pageRes.text();
-      pageContent = html
-        .replace(/<script[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s{2,}/g, ' ')
-        .trim()
-        .slice(0, 15000);
-    }
-  } catch (e) { /* page fetch failed, will use web search fallback */ }
+  // Extract listing ID and suburb from URL for a precise search query
+  const listingId = (propertyUrl.match(/(\d{8,})/) || [])[1] || '';
+  const suburbanMatch = propertyUrl.match(/(?:nsw|vic|qld|sa|wa|tas|act|nt)-(.+?)-\d/);
+  const suburb = suburbanMatch ? suburbanMatch[1].replace(/-/g, ' ') : '';
+  const site = propertyUrl.includes('domain.com.au') ? 'domain.com.au' : 'realestate.com.au';
 
-  // Build the Claude request
-  let claudeBody;
+  const searchQuery = listingId
+    ? `${listingId} ${suburb} ${site} property listing inspections`
+    : `${propertyUrl}`;
 
-  if (pageContent) {
-    // Best case: we have the page HTML, just ask Claude to extract
-    claudeBody = {
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
-      messages: [{
-        role: 'user',
-        content: `Extract property details from this listing page text. Return ONLY a raw JSON object, no markdown fences, no explanation.
+  const messages = [{
+    role: 'user',
+    content: `Search for this Australian property listing and return its details as JSON.
 
-PAGE TEXT:
-${pageContent}
+Search for: "${searchQuery}"
 
-JSON shape to return:
-{"address":"full street address","suburb":"suburb","priceGuide":"$1.2M or Contact Agent","bedrooms":3,"bathrooms":2,"parking":1,"propertyType":"house/townhouse/apartment","internalSize":"120m² or null","description":"2-3 sentence description","inspections":[{"date":"Saturday 14 Jun","time":"10:00am - 10:30am"}],"auctionDate":"date or null","agent":"name","agency":"agency","schoolCatchment":"school or null","outgoings":"fees or null"}
+The listing URL is: ${propertyUrl}
 
-Use null for any missing field. Include every upcoming inspection found.`
-      }]
-    };
-  } else {
-    // Fallback: use web_search tool to find the listing
-    claudeBody = {
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: [{
-        role: 'user',
-        content: `Search for this property listing and extract its details: ${propertyUrl}
+After searching, you MUST return ONLY a JSON object. No explanation, no markdown fences. If you cannot find some details, use null. You must always return valid JSON.
 
-Return ONLY a raw JSON object (no markdown, no explanation):
-{"address":"full street address","suburb":"suburb","priceGuide":"$1.2M or Contact Agent","bedrooms":3,"bathrooms":2,"parking":1,"propertyType":"house/townhouse/apartment","internalSize":"120m² or null","description":"2-3 sentence description","inspections":[{"date":"Saturday 14 Jun","time":"10:00am - 10:30am"}],"auctionDate":"date or null","agent":"name","agency":"agency","schoolCatchment":"school or null","outgoings":"fees or null"}
+Required format:
+{"address":"full street address","suburb":"suburb name","priceGuide":"$X or Contact Agent","bedrooms":3,"bathrooms":2,"parking":1,"propertyType":"townhouse","internalSize":"120m² or null","description":"2-3 sentences","inspections":[{"date":"Saturday 14 Jun","time":"10:00am - 10:30am"}],"auctionDate":"date or null","agent":"name or null","agency":"agency or null","schoolCatchment":null,"outgoings":null}
 
-Use null for missing fields. Include all upcoming inspections.`
-      }]
-    };
-  }
+If you truly cannot find anything, return: {"address":null,"suburb":null,"priceGuide":null,"bedrooms":null,"bathrooms":null,"parking":null,"propertyType":null,"internalSize":null,"description":null,"inspections":[],"auctionDate":null,"agent":null,"agency":null,"schoolCatchment":null,"outgoings":null}`
+  }];
 
-  // Agentic loop to handle tool use (web_search fallback may need multiple turns)
-  const messages = claudeBody.messages;
-  for (let turn = 0; turn < 6; turn++) {
+  const claudeBody = {
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 1000,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+  };
+
+  for (let turn = 0; turn < 8; turn++) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -92,6 +61,7 @@ Use null for missing fields. Include all upcoming inspections.`
     });
 
     const data = await res.text();
+
     if (!res.ok) {
       return { statusCode: res.status, headers: { 'Content-Type': 'application/json' }, body: data };
     }
@@ -104,16 +74,18 @@ Use null for missing fields. Include all upcoming inspections.`
 
     if (json.stop_reason === 'tool_use') {
       messages.push({ role: 'assistant', content: json.content });
-      const results = json.content
+      const toolResults = json.content
         .filter(b => b.type === 'tool_use')
         .map(b => ({ type: 'tool_result', tool_use_id: b.id, content: b.content || '' }));
-      messages.push({ role: 'user', content: results });
+      messages.push({ role: 'user', content: toolResults });
       continue;
     }
 
-    // Any other stop reason — return whatever we got
     return { statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: data };
   }
 
-  return { statusCode: 500, body: JSON.stringify({ error: { message: 'Could not extract property data after multiple attempts' } }) };
+  return {
+    statusCode: 500,
+    body: JSON.stringify({ error: { message: 'Could not retrieve property data' } })
+  };
 };
